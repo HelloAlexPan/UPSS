@@ -1,155 +1,188 @@
-# **Universal Predictive Signal Standard (UPSS) Specification**
+# Universal Predictive Signal Standard (UPSS) v0.2
 
-**Version 0.1**
+A strict, machine-verifiable format for exchanging time-stamped numerical observations plus the metadata modern predictive models require.
 
-The Universal Predictive Signal Standard (UPSS) is a vendor-neutral specification for defining the format of predictive signals, especially those derived from unstructured or semi-structured data. It provides a common, context-rich structure that enables interoperability between signal extraction systems and downstream consumers like predictive models and business intelligence tools. By standardizing the "last-mile" of data preparation for predictive tasks, UPSS aims to accelerate the development and deployment of of predictive models.
+## 1. Purpose
+- Guarantee that any producer can publish a time-series record that any consumer can parse, validate and use in a model pipeline without an out-of-band contract.
+- Preserve accuracy (units, precision, quality flags), consistency (canonical field names & types), scalability (partitioning rules, columnar layouts) and interoperability (JSON, CSV, Parquet, Arrow, SQL/TSDB).
+- Embed full lineage, security and compliance metadata.
 
----
+## 2. Model Requirements
+### 2.1. Accuracy
+- ISO-8601 UTC timestamps (≥ 1 s precision, optional µs).
+- Explicit measurement units & value type.
+- Optional uncertainty & quality flag.
 
-### **1. Foundational Principles**
+### 2.2. Consistency
+- Canonical field names & datatypes (strict schema).
+- Reference data dictionaries for units, locations.
 
-The design of UPSS is guided by several principles to ensure its broad applicability, longevity, and ease of use.
+### 2.3. Scalability
+- Support billions of rows via partition keys, compression, stream chunking.
 
-*   **Industry/Use-Case Agnosticism:** The standard is fundamentally versatile, capable of representing signals from any domain, whether numerical sensor readings or qualitative assessments from sales calls.
-*   **Extensibility:** The standard is inherently extensible to accommodate new types of signals and metadata without necessitating breaking changes to the core specification.
-*   **Time-Sensitivity:** Predictive signals are inherently temporal. The standard rigorously preserves the time dimension, capturing the precise moment an observation occurred.
-*   **Simplicity and Intuitive Use:** To encourage widespread adoption, the standard is straightforward to understand and implement. The structure is logical and leverages common formats like JSON.
+### 2.4. Interoperability
+- At minimum: CSV & JSON lines (single-row records), and columnar (Parquet/Arrow) using identical field order & names.
+- JSON-Schema & Apache Avro IDs.
 
-### **2. Leveraging CloudEvents for Context Metadata**
+### 2.5. Security / Privacy
+- Mandatory classification tag, optional encryption hint.
+- Per-record PII flag.
 
-To avoid reinventing the wheel, UPSS leverages the [CloudEvents v1.0.2 specification](https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md) for the event envelope. This provides a mature, widely adopted standard for describing event context.
+## 3. Data Structure Design
+### 3.1 Field Specification
 
-*   **REQUIRED CloudEvents Attributes:** `id`, `source`, `specversion`, `type`, `time`, `datacont
-*   enttype`.
-*   **OPTIONAL CloudEvents Attributes:** `subject`, `dataschema`.
+| # | Field | Type | Mode | Description / Allowed values |
+|---|-------|------|------|------------------------------|
+| 1 | timestamp | string | REQUIRED | ISO 8601 UTC (`YYYY-MM-DDThh:mm:ss[.ffffff]`) |
+| 2 | sensor_id | string | REQUIRED | Stable identifier of measurement source (UUID, URI, or integer in string) |
+| 3 | location | string | REQUIRED | ISO 3166-1 alpha-2 + freeform sub-location (`US/NYC/Warehouse-3`) |
+| 4 | measurement_unit | string | REQUIRED | UCUM code (`Cel`, `kg`, `%` …); "dimensionless" allowed |
+| 5 | value | number | REQUIRED | 64-bit floating point |
+| 6 | quality_flag | string | OPTIONAL | Enum: `OK`, `MISSING`, `SUSPECT`, `ESTIMATED` |
+| 7 | uncertainty | number | OPTIONAL | ±1 σ expressed in same unit as value |
+| 8 | data_source | string | REQUIRED | System-of-record or pipeline ID (`scada://plantA/line4`) |
+| 9 | provenance_id | string | REQUIRED | UUID v4 tying this row to upstream event/ETL job |
+| 10 | schema_version | string | REQUIRED | `UPSS-0.2` |
+| 11 | pii_flag | boolean | OPTIONAL | true if record contains PII |
+| 12 | classification | string | REQUIRED | Enum: `PUBLIC`, `INTERNAL`, `CONFIDENTIAL`, `RESTRICTED` |
+| 13 | tags | object | OPTIONAL | Arbitrary key–value pairs (string:string) |
 
-The `specversion` for this version of the standard MUST be `"UPSS-0.1"`. The `datacontenttype` SHOULD be `application/json`.
+All additional keys MUST reside under `tags` to keep the top-level schema stable.
 
-### **3. The UPSS `data` Payload**
+### 3.2 Timestamp Format
+`2024-01-01T12:00:00Z` (sec) or `2024-01-01T12:00:00.123456Z` (µs). Always UTC.
 
-The `data` attribute is the core of the UPSS. It is a JSON object designed to be both human-readable and machine-consumable, providing a rich, multi-faceted view of a predictive signal.
+## 4. Data Handling Guidelines
+### 4.1 Ingestion & Cleansing
+- Validate JSON-Schema (or Avro) on arrival; reject or quarantine non-conforming rows.
+- Deduplicate by (sensor_id, timestamp); keep the record with highest quality_flag precedence (OK> ESTIMATED> SUSPECT> MISSING).
+- Out-of-order arrivals allowed within a configurable "lateness" window (default 1 day); late but valid rows are merged.
+### 4.2 Error Handling
+- If value is unparseable, set quality_flag = "MISSING" and value = null.
+- If timestamp invalid → entire record to dead-letter queue.
+- Unknown measurement_unit → map via unit dictionary; on failure, reject.
+### 4.3 Normalisation
+- Units: convert to canonical unit per sensor (e.g. Fahrenheit → Celsius).
+- Scaling: optional Min-Max or z-score stored in feature store; do not overwrite raw value.
+- Missing gaps: fill only in model-specific feature pipelines, not in raw UPSS tables.
 
-#### **4.1. `provenance`**
+## 5. Exchange and Storage Formats
+### 5.1 CSV (UTF-8)
+Ordered columns exactly as listed in §3.1 (timestamp … tags).
 
-*   **Type:** `String`
-*   **Constraints:** REQUIRED
-*   **Description:** A human-readable description of the signal's origin and how it was generated for auditability.
+Example row (line breaks added for clarity):
 
-#### **4.2. `target`**
+`2025-04-16T14:30:00Z,thermo-42,US/NYC/Warehouse-3,Cel,23.4,OK,,iot-gateway-7,6f125...,UPSS-0.2,false,INTERNAL,"{""shift"":""B""}"`
 
-*   **Type:** `Object`
-*   **Constraints:** REQUIRED
-*   **Description:** Describes the predictive target this signal is relevant for.
-    *   `id` (String): A unique identifier for the prediction target (e.g., `customer_churn_risk_90d`).
-    *   `description` (String): A human-readable description.
-
-#### **4.3. `series`**
-
-*   **Type:** `Array` of `Objects`
-*   **Constraints:** OPTIONAL
-*   **Description:** The core numerical time series data associated with the signal.
-    *   `timestamp` (Timestamp): The timestamp of the data point.
-    *   `value` (Number): The numerical value.
-
-#### **4.4. `context`**
-
-*   **Type:** `Object`
-*   **Constraints:** OPTIONAL
-*   **Description:** The rich, natural language context that qualifies the numerical data. This field is designed to handle complex, nested, and qualitative information, ensuring human auditability and trust as well as making it ideal for consumption by context-aware models like LLMs.
-
-#### **4.5. `features`**
-
-*   **Type:** `Array` of `Objects`
-*   **Constraints:** OPTIONAL
-*   **Description:** A collection of structured, quantifiable features derived from the `context` for models like XGBoost, ARIMA, and BI tools. It is a flattened, machine-readable representation of the key insights contained within the `context` object.
-*   **Object Structure:** Each object in the array is a feature and MUST contain:
-    *   `name` (String): The feature name (e.g., `is_holiday`).
-    *   `value` (Number/String/Boolean): The feature value.
-    *   `timestamp` (Timestamp): For point-in-time features.
-    *   `time_range` (Object, OPTIONAL): For features spanning a duration, containing `start` and `end` timestamps.
-
-### **5. Example: Complex Qualitative Signal**
-
-This example showcases the full power of UPSS to represent a complex, qualitative signal extracted from a sales call transcript. It demonstrates how both the rich, nested `context` and the simplified, tabular `features` can coexist in a single signal.
+### 5.2 JSON Lines
+Each line is a full record:
 
 ```json
 {
-  "specversion": "UPSS-0.1",
-  "type": "com.example.sales.qualification_analysis",
-  "source": "/sales/opportunity/opp_789",
-  "subject": "call_transcript_abc",
-  "id": "evt-uuid-qual-5678",
-  "time": "2025-04-16T14:30:00Z",
-  "datacontenttype": "application/json",
-  "dataschema": "https://example.com/schemas/sales-qualification-signals/v0.1.json",
-  "data": {
-    "provenance": "Signal extracted from sales call transcript 'call_transcript_abc' using qualification model v2.1.",
-    "target": {
-      "id": "opportunity_close_probability_90d",
-      "description": "Probability of sales opportunity closing successfully in the next 90 days."
-    },
-    "context": {
-      "qualification_signals": {
-        "need_and_pain_points": {
-          "explicit_problem_statements": {
-            "assessment": "High",
-            "evidence": ["Customer stated 'current solution is too slow'", "Mentioned impact on quarterly targets"]
-          },
-          "quantified_pain": {
-            "assessment": "Medium",
-            "evidence": ["Estimated $50k loss per quarter"]
-          }
-        },
-        "authority_and_decision_making": {
-          "decision_maker_confirmation": {
-            "assessment": "Low",
-            "evidence": ["'I need to run this by my manager'"]
-          }
-        }
-      }
-    },
-    "features": [
-      {
-        "name": "explicit_problem_assessment",
-        "value": "High",
-        "timestamp": "2025-04-16T14:30:00Z"
-      },
-      {
-        "name": "quantified_pain_assessment",
-        "value": "Medium",
-        "timestamp": "2025-04-16T14:30:00Z"
-      },
-      {
-        "name": "decision_maker_confirmed",
-        "value": false,
-        "timestamp": "2025-04-16T14:30:00Z"
-      },
-      {
-        "name": "qualification_score",
-        "value": 0.65,
-        "timestamp": "2025-04-16T14:30:00Z"
-      }
-    ]
-  }
+  "timestamp":"2025-04-16T14:30:00Z",
+  "sensor_id":"thermo-42",
+  "location":"US/NYC/Warehouse-3",
+  "measurement_unit":"Cel",
+  "value":23.4,
+  "quality_flag":"OK",
+  "data_source":"iot-gateway-7",
+  "provenance_id":"6f125c08-3c22-4a0e-b6b7-13e58a48d9d1",
+  "schema_version":"UPSS-0.2",
+  "classification":"INTERNAL",
+  "tags":{"shift":"B"}
+}
+```
+```json
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://upss.io/schema/0.2.json",
+  "type":"object",
+  "required":["timestamp","sensor_id","location","measurement_unit","value","data_source","provenance_id","schema_version","classification"],
+  "properties":{
+    "timestamp":{"type":"string","format":"date-time"},
+    "sensor_id":{"type":"string","minLength":1},
+    "location":{"type":"string"},
+    "measurement_unit":{"type":"string","minLength":1},
+    "value":{"type":["number","null"]},
+    "quality_flag":{"type":"string","enum":["OK","MISSING","SUSPECT","ESTIMATED"]},
+    "uncertainty":{"type":"number"},
+    "data_source":{"type":"string"},
+    "provenance_id":{"type":"string","format":"uuid"},
+    "schema_version":{"type":"string","const":"UPSS-0.2"},
+    "pii_flag":{"type":"boolean"},
+    "classification":{"type":"string","enum":["PUBLIC","INTERNAL","CONFIDENTIAL","RESTRICTED"]},
+    "tags":{"type":"object","additionalProperties":{"type":"string"}}
+  },
+  "additionalProperties":false
 }
 ```
 
-### **6. Design Rationale & Use Cases**
+### 5.3 Columnar / Binary
+- Parquet or Arrow using same field names; Snappy (Parquet) or ZSTD (Arrow) compression.
+- Partition keys: `p_date = DATE(timestamp)`, `sensor_id_hash = hash32(sensor_id) mod 128`.
 
-UPSS is designed to solve common, practical problems in predictive modeling:
+### 5.4 Time-Series Databases
+- Table DDL (TimescaleDB / PostgreSQL):
 
-*   **Problem:** Using unstructured text in predictive models is hard and requires bespoke feature engineering for every project.
-    *   **UPSS Solution:** The `context` and `features` attributes provide a standardized structure. The `context` object holds the rich, nested, qualitative text for advanced models, while the `features` object provides immediately usable, structured data for traditional models. This eliminates the need for redundant "last-mile" ETL for every new project.
+```sql
+CREATE TABLE UPSS (
+  timestamp        TIMESTAMPTZ NOT NULL,
+  sensor_id        TEXT        NOT NULL,
+  location         TEXT        NOT NULL,
+  measurement_unit TEXT        NOT NULL,
+  value            DOUBLE PRECISION,
+  quality_flag     TEXT,
+  uncertainty      DOUBLE PRECISION,
+  data_source      TEXT NOT NULL,
+  provenance_id    UUID NOT NULL,
+  schema_version   TEXT NOT NULL,
+  pii_flag         BOOLEAN,
+  classification   TEXT NOT NULL,
+  tags             JSONB
+);
 
-*   **Problem:** My forecasts are often wrong because they miss crucial context that isn't in the historical numbers.
-    *   **UPSS Solution:** The `context` object allows for the encoding of future events, scenarios, and known limitations directly into the data stream, enabling models to produce more realistic and reliable predictions.
+SELECT create_hypertable('UPSS','timestamp',chunk_time_interval => INTERVAL '1 day');
+CREATE INDEX ON UPSS (sensor_id, timestamp DESC);
+```
 
-*   **Problem:** It's difficult to combine signals from different sources (e.g., sales calls and support tickets) to get a holistic view of a customer.
-    *   **UPSS Solution:** The common `subject` attribute and standardized format allow signals from any source to be merged into a single, time-ordered stream for a given entity, enabling more powerful, multi-faceted models.
+## 6. Scalability Considerations
+### 6.1 Partitioning
+- Daily (or hourly for >10 M rows/day) time partitions.
+- Hash sub-partition on sensor_id to avoid hotspotting.
 
-*   **Problem:** I can't trust my model's predictions because I don't know where the data came from.
-    *   **UPSS Solution:** The `source` and `provenance` attributes provide a clear audit trail, ensuring that every predictive signal is traceable back to its origin.
+### 6.2 Compression
+- Delta + Gorilla codec in TSDBs; Snappy/ZSTD for Parquet; dictionary encoding for location, quality_flag.
 
-### **7. Schema Versioning and Evolution**
+### 6.3 Streaming
+- Kafka topic UPSS.v1.raw with max 1 MB messages; use exactly-once semantics.
+– Schema fingerprint embedded in Kafka message headers for fast validation.
 
-UPSS uses Semantic Versioning (SemVer). The `specversion` attribute refers to the version of this document. The `dataschema` URI should also be versioned. Backward compatibility is prioritized for MINOR/PATCH versions. Breaking changes to the payload structure require a MAJOR version bump in the `dataschema` URI.
+### 6.4 Indexing
+- Composite (sensor_id, timestamp) B-tree or skip-list index.
+- Bloom filters on Parquet row-groups for sensor_id.
+
+### 6.5 Query patterns
+- "Last-N" look-ups: clustered index by (sensor_id, timestamp DESC) covers sliding-window prediction.
+- Aggregation jobs should leverage predicate push-down and column pruning.
+
+## 7. Examples
+### 7.1 Normal Row
+
+| timestamp | sensor_id | location | measurement_unit | value | quality_flag | uncertainty | data_source | provenance_id | schema_version | pii_flag | classification | tags |
+|-----------|-----------|----------|------------------|-------|--------------|-------------|-------------|---------------|----------------|----------|----------------|------|
+| 2025-04-16T14:30:00Z | thermo-42 | US/NYC/Warehouse-3 | Cel | 23.4 | OK | 0.1 | iot-gateway-7 | 6f125c08-3c22-4a0e-b6b7-13e58a48d9d1 | UPSS-0.2 | false | INTERNAL | {"shift":"B"} |
+
+### 7.2 Missing Value
+`2025-04-16T14:31:00Z,thermo-42,US/NYC/Warehouse-3,Cel,,MISSING,,iot-gateway-7,33e9...,UPSS-0.2,false,INTERNAL,"{}"`
+
+### 7.3 Corrupted Timestamp (rejected)
+`2025/04/16 14:32,thermo-42,US/NYC/Warehouse-3,Cel,23.6,OK,,iot-gateway-7,beef...,UPSS-0.2,false,INTERNAL,"{}"`
+
+→ Sent to dead-letter; error code `INVALID_TIMESTAMP`.
+
+## 8. Notes
+
+- Time-zone discrepancies: always converted to UTC prior to publication; original zone can be stored in tags.original_tz.
+- Security & privacy: if classification ≥ CONFIDENTIAL, the transport layer MUST be encrypted (TLS 1.2+).
+- Extensibility: new optional fields MUST be placed under tags; a future MAJOR version may promote stable ones.
+- Governance: change-data-capture of the UPSS table is registered with OpenLineage; provenance_id links back to source artefacts.
